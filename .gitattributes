@@ -1,0 +1,10 @@
+# Biome formats to LF. Without this, a Windows checkout with the common
+# `core.autocrlf=true` setting rewrites every file to CRLF and `pnpm check` fails on
+# essentially the whole repository.
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.wav binary
+*.woff binary
+*.woff2 binary

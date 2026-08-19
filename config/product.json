@@ -1,0 +1,12 @@
+{
+  "cloudflareOAuthClientId": "1c413f324b518b452096929b847e6703",
+  "cloudflareOAuthRedirectUri": "https://auth.hqbase.io/oauth/callback",
+  "cloudflareOAuthRelayUrl": "https://auth.hqbase.io",
+  "cloudflareOAuthScopes": {
+    "setup": "workers-scripts.write zone.read zone-settings.write email-routing-rule.write email-sending.write",
+    "domains": "workers-scripts.write zone.read zone-settings.write email-routing-rule.write email-sending.write",
+    "updates": "workers-scripts.write workers-ci.write zone.read"
+  },
+  "releaseManifestUrl": "https://github.com/HQBase/hqbase/releases/latest/download/stable.json",
+  "releasePublicKey": "MCowBQYDK2VwAyEARmCVvXVUDzwewmIDAVez9Uyv2K+7ylU6+YhR5iN2WTc="
+}

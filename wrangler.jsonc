@@ -1,0 +1,64 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hqbase",
+  "main": "worker/index.ts",
+  "preview_urls": false,
+  "compatibility_date": "2026-07-28",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/api/*",
+      "/mcp",
+      "/mcp/*",
+      "/.well-known/*",
+      "/skills/hqbase-mail/SKILL.md",
+      "/AGENTS.md",
+      "/agents.md"
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false
+    }
+  },
+  "secrets": {
+    "required": ["BETTER_AUTH_SECRET"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hqbase",
+      "database_id": "6cd4fdd5-69c6-472d-8bf6-d8894dd45dca",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MAIL_OBJECTS",
+      "bucket_name": "hqbase","preview_bucket_name": "hqbase"
+    }
+  ],
+  "queues": {
+    "producers": [{ "binding": "HQBASE_JOBS", "queue": "hqbase-jobs" }],
+    "consumers": [
+      {
+        "queue": "hqbase-jobs",
+        "dead_letter_queue": "hqbase-jobs-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3
+      }
+    ]
+  },
+  "triggers": { "crons": ["17 3 * * *"] },
+  "send_email": [
+    {
+      "name": "MAIL_SENDER"
+    }
+  ]
+}

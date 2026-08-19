@@ -1,0 +1,389 @@
+import type { WorkerEnv } from "../lib/env";
+import { AppError } from "../lib/errors";
+import { enforceRateLimit } from "../security/rate-limit";
+
+import { authOrigin } from "./auth";
+import { hashOAuthToken } from "./oauth-token";
+import { type AuthContext, requireAuthContext } from "./session";
+
+export const deviceCodeGrantType = "urn:ietf:params:oauth:grant-type:device_code";
+
+const accessTokenPrefix = "hqb_access_";
+const refreshTokenPrefix = "hqb_refresh_";
+const deviceVerificationWindowSeconds = 15 * 60;
+
+type DeviceCodeRow = {
+  id: string;
+  userCode: string;
+  userId: string | null;
+  expiresAt: string;
+  status: string;
+  clientId: string | null;
+  oauthClientId: string | null;
+  scope: string | null;
+  resources: string | null;
+  sessionId: string | null;
+};
+
+type ConsentRow = {
+  id: string;
+  scopes: string;
+  resources: string | null;
+};
+
+type OAuthTokenPayload = {
+  access_token?: unknown;
+  refresh_token?: unknown;
+};
+
+export function enforceDeviceVerificationRateLimit(
+  env: WorkerEnv,
+  request: Request
+): Promise<void> {
+  return enforceRateLimit(env.DB, env.BETTER_AUTH_SECRET, {
+    scope: "oauth.device.verify.ip",
+    subject: request.headers.get("cf-connecting-ip") ?? "unknown",
+    limit: 5,
+    windowSeconds: deviceVerificationWindowSeconds
+  });
+}
+
+export async function approveDeviceAuthorization(
+  env: WorkerEnv,
+  request: Request
+): Promise<Response> {
+  if (!hasSameOrigin(request, env)) {
+    return oauthError(
+      403,
+      "access_denied",
+      "The approval request must come from this HQBase installation."
+    );
+  }
+
+  let authContext: AuthContext;
+  try {
+    authContext = await requireAuthContext(env, request);
+  } catch (error) {
+    if (error instanceof AppError) {
+      return oauthError(
+        error.status === 401 ? 401 : 403,
+        error.status === 401 ? "unauthorized" : "access_denied",
+        error.message
+      );
+    }
+    throw error;
+  }
+
+  const body = await request
+    .clone()
+    .json<{ userCode?: unknown }>()
+    .catch(() => null);
+  if (!body || typeof body.userCode !== "string" || body.userCode.trim().length === 0) {
+    return oauthError(400, "invalid_request", "A user code is required.");
+  }
+
+  const code = await findDeviceCodeByUserCode(env.DB, body.userCode);
+  if (!code) return oauthError(400, "invalid_request", "The user code is invalid.");
+  if (Date.parse(code.expiresAt) <= Date.now()) {
+    return oauthError(400, "expired_token", "The user code has expired.");
+  }
+  if (code.status !== "pending") {
+    return oauthError(400, "invalid_request", "This device authorization was already processed.");
+  }
+  if (!code.userId || code.userId !== authContext.user.id) {
+    return oauthError(403, "access_denied", "You are not authorized to approve this request.");
+  }
+
+  const clientId = code.oauthClientId ?? code.clientId;
+  if (!clientId || (code.oauthClientId && code.clientId && code.oauthClientId !== code.clientId)) {
+    return oauthError(400, "invalid_request", "The OAuth client could not be verified.");
+  }
+
+  await preserveConsent(env.DB, {
+    clientId,
+    resources: parseStoredList(code.resources),
+    scopes: parseScopes(code.scope),
+    userId: authContext.user.id
+  });
+
+  const approved = await env.DB.prepare(
+    `UPDATE deviceCode
+     SET status = 'approved', sessionId = ?
+     WHERE id = ? AND status = 'pending' AND userId = ?`
+  )
+    .bind(authContext.session.id, code.id, authContext.user.id)
+    .run();
+  if (approved.meta.changes !== 1) {
+    return oauthError(400, "invalid_request", "This device authorization was already processed.");
+  }
+
+  return Response.json(
+    { success: true },
+    { headers: { "cache-control": "no-store", pragma: "no-cache" } }
+  );
+}
+
+export async function handleDeviceTokenRequest(
+  env: WorkerEnv,
+  request: Request,
+  handle: () => Promise<Response>
+): Promise<Response> {
+  const tokenRequest = await readTokenRequest(request);
+  if (tokenRequest.grantType !== deviceCodeGrantType) return handle();
+
+  const code = tokenRequest.deviceCode
+    ? await env.DB.prepare(
+        `SELECT id, userCode, userId, expiresAt, status, clientId, oauthClientId,
+                scope, resources, sessionId
+         FROM deviceCode
+         WHERE deviceCode = ?`
+      )
+        .bind(tokenRequest.deviceCode)
+        .first<DeviceCodeRow>()
+    : null;
+
+  if (code?.status === "approved") {
+    if (!code.userId || !code.sessionId || !(await isActiveSession(env.DB, code))) {
+      await env.DB.prepare("DELETE FROM deviceCode WHERE id = ?").bind(code.id).run();
+      return oauthError(400, "access_denied", "The approving HQBase session is no longer active.");
+    }
+  }
+
+  const response = await handle();
+  if (!response.ok) return response;
+
+  if (!code?.userId || !code.sessionId) {
+    return discardUnboundTokenResponse(
+      env.DB,
+      response,
+      "The device authorization was not bound to an HQBase session."
+    );
+  }
+
+  const payload = await response
+    .clone()
+    .json<OAuthTokenPayload>()
+    .catch(() => null);
+  const accessToken = typeof payload?.access_token === "string" ? payload.access_token : null;
+  const refreshToken = typeof payload?.refresh_token === "string" ? payload.refresh_token : null;
+  if (!accessToken?.startsWith(accessTokenPrefix)) {
+    return discardUnboundTokenResponse(env.DB, response, "The OAuth token response was invalid.");
+  }
+
+  const accessTokenHash = await hashOAuthToken(accessToken.slice(accessTokenPrefix.length));
+  const statements = [
+    env.DB.prepare(
+      `UPDATE oauthAccessToken
+       SET sessionId = ?
+       WHERE token = ? AND userId = ? AND clientId = ?`
+    ).bind(code.sessionId, accessTokenHash, code.userId, code.oauthClientId ?? code.clientId)
+  ];
+  if (refreshToken?.startsWith(refreshTokenPrefix)) {
+    statements.push(
+      env.DB.prepare(
+        `UPDATE oauthRefreshToken
+         SET sessionId = ?
+         WHERE token = ? AND userId = ? AND clientId = ?`
+      ).bind(
+        code.sessionId,
+        await hashOAuthToken(refreshToken.slice(refreshTokenPrefix.length)),
+        code.userId,
+        code.oauthClientId ?? code.clientId
+      )
+    );
+  }
+
+  const results = await env.DB.batch(statements);
+  if (results.some((result) => result.meta.changes !== 1)) {
+    await deleteIssuedTokens(env.DB, accessToken, refreshToken);
+    return oauthError(
+      500,
+      "server_error",
+      "The OAuth token could not be bound to the approving session."
+    );
+  }
+  return response;
+}
+
+async function readTokenRequest(request: Request): Promise<{
+  deviceCode: string | null;
+  grantType: string | null;
+}> {
+  const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    const params = await request.clone().formData();
+    return {
+      deviceCode: stringFormValue(params.get("device_code")),
+      grantType: stringFormValue(params.get("grant_type"))
+    };
+  }
+  if (contentType.includes("application/json")) {
+    const body = await request
+      .clone()
+      .json<{ device_code?: unknown; grant_type?: unknown }>()
+      .catch(() => null);
+    return {
+      deviceCode: typeof body?.device_code === "string" ? body.device_code : null,
+      grantType: typeof body?.grant_type === "string" ? body.grant_type : null
+    };
+  }
+  return { deviceCode: null, grantType: null };
+}
+
+function stringFormValue(value: FormDataEntryValue | null): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+async function findDeviceCodeByUserCode(
+  db: D1Database,
+  suppliedCode: string
+): Promise<DeviceCodeRow | null> {
+  const exact = suppliedCode.trim();
+  const normalized = exact.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  return db
+    .prepare(
+      `SELECT id, userCode, userId, expiresAt, status, clientId, oauthClientId,
+              scope, resources, sessionId
+       FROM deviceCode
+       WHERE userCode = ? OR userCode = ?
+       ORDER BY CASE WHEN userCode = ? THEN 0 ELSE 1 END
+       LIMIT 1`
+    )
+    .bind(exact, normalized, exact)
+    .first<DeviceCodeRow>();
+}
+
+async function preserveConsent(
+  db: D1Database,
+  input: { clientId: string; resources: string[]; scopes: string[]; userId: string }
+): Promise<void> {
+  const existing = await db
+    .prepare(
+      `SELECT id, scopes, resources
+       FROM oauthConsent
+       WHERE clientId = ? AND userId = ?
+       ORDER BY updatedAt DESC
+       LIMIT 1`
+    )
+    .bind(input.clientId, input.userId)
+    .first<ConsentRow>();
+  const scopes = [
+    ...new Set([...(existing ? parseStoredList(existing.scopes) : []), ...input.scopes])
+  ];
+  const resources = [
+    ...new Set([...(existing ? parseStoredList(existing.resources) : []), ...input.resources])
+  ];
+  const now = new Date().toISOString();
+
+  if (existing) {
+    await db
+      .prepare("UPDATE oauthConsent SET scopes = ?, resources = ?, updatedAt = ? WHERE id = ?")
+      .bind(JSON.stringify(scopes), JSON.stringify(resources), now, existing.id)
+      .run();
+    return;
+  }
+
+  await db
+    .prepare(
+      `INSERT INTO oauthConsent
+       (id, clientId, userId, scopes, resources, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      crypto.randomUUID(),
+      input.clientId,
+      input.userId,
+      JSON.stringify(scopes),
+      JSON.stringify(resources),
+      now,
+      now
+    )
+    .run();
+}
+
+async function isActiveSession(db: D1Database, code: DeviceCodeRow): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT id
+       FROM "session"
+       WHERE id = ? AND userId = ? AND expiresAt > ?`
+    )
+    .bind(code.sessionId, code.userId, new Date().toISOString())
+    .first<{ id: string }>();
+  return row !== null;
+}
+
+async function discardUnboundTokenResponse(
+  db: D1Database,
+  response: Response,
+  description: string
+): Promise<Response> {
+  const payload = await response
+    .clone()
+    .json<OAuthTokenPayload>()
+    .catch(() => null);
+  await deleteIssuedTokens(
+    db,
+    typeof payload?.access_token === "string" ? payload.access_token : null,
+    typeof payload?.refresh_token === "string" ? payload.refresh_token : null
+  );
+  return oauthError(500, "server_error", description);
+}
+
+async function deleteIssuedTokens(
+  db: D1Database,
+  accessToken: string | null,
+  refreshToken: string | null
+): Promise<void> {
+  const statements: D1PreparedStatement[] = [];
+  if (accessToken?.startsWith(accessTokenPrefix)) {
+    statements.push(
+      db
+        .prepare("DELETE FROM oauthAccessToken WHERE token = ?")
+        .bind(await hashOAuthToken(accessToken.slice(accessTokenPrefix.length)))
+    );
+  }
+  if (refreshToken?.startsWith(refreshTokenPrefix)) {
+    statements.push(
+      db
+        .prepare("DELETE FROM oauthRefreshToken WHERE token = ?")
+        .bind(await hashOAuthToken(refreshToken.slice(refreshTokenPrefix.length)))
+    );
+  }
+  if (statements.length > 0) await db.batch(statements);
+}
+
+function hasSameOrigin(request: Request, env: WorkerEnv): boolean {
+  const requestOrigin = request.headers.get("origin");
+  return requestOrigin !== null && requestOrigin === authOrigin(env, request);
+}
+
+function parseScopes(value: string | null): string[] {
+  return value?.split(/\s+/).filter(Boolean) ?? [];
+}
+
+function parseStoredList(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item): item is string => typeof item === "string");
+    }
+  } catch {
+    // Older adapters may persist a space-delimited value.
+  }
+  return value.split(/\s+/).filter(Boolean);
+}
+
+function oauthError(status: number, error: string, errorDescription: string): Response {
+  return Response.json(
+    { error, error_description: errorDescription },
+    {
+      status,
+      headers: {
+        "cache-control": "no-store",
+        pragma: "no-cache"
+      }
+    }
+  );
+}

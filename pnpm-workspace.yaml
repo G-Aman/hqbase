@@ -1,0 +1,25 @@
+packages:
+  - .
+
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true
+
+overrides:
+  '@better-auth/core': 1.7.0-rc.6
+  '@hono/node-server': 2.0.12
+  fast-uri: 3.1.4
+  postcss: 8.5.23
+
+minimumReleaseAgeExclude:
+  - '@cloudflare/workers-types@5.20260711.1'
+  - '@better-auth/core@1.7.0-rc.6'
+  - '@better-auth/drizzle-adapter@1.7.0-rc.6'
+  - '@better-auth/kysely-adapter@1.7.0-rc.6'
+  - '@better-auth/memory-adapter@1.7.0-rc.6'
+  - '@better-auth/mongo-adapter@1.7.0-rc.6'
+  - '@better-auth/oauth-provider@1.7.0-rc.6'
+  - '@better-auth/prisma-adapter@1.7.0-rc.6'
+  - '@better-auth/telemetry@1.7.0-rc.6'
+  - better-auth@1.7.0-rc.6
